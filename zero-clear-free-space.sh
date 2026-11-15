@@ -91,9 +91,11 @@ wipe_free_on_mounted() {
 }
 
 main() {
+    echo ""
     echo "========================================"
-    echo "   WIPE FREE SPACE ON PARTITIONS        "
+    bold "   WIPE FREE SPACE ON PARTITIONS        "
     echo "========================================"
+    echo ""
     echo ""
     echo "Available drives and partitions:"
     lsblk -o NAME,SIZE,MODEL,TRAN,FSTYPE,LABEL,MOUNTPOINT
@@ -227,7 +229,7 @@ main() {
 
     echo ""
     echo "========================================"
-    echo "  DONE: FREE SPACE ZEROED              "
+    bold "  DONE: FREE SPACE ZEROED              "
     echo "========================================"
 }
 

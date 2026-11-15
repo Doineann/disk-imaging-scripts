@@ -15,6 +15,29 @@ DD_BS=64M
 # Stored as an array so each argument is passed intact to pv.
 PV_OPTS=(-w 70 --format '%b %p %r')
 
+# --- Colors ---------------------------------------------------------------
+# ANSI codes, auto-disabled when stdout is not a TTY (so piped/redirected output
+# stays clean). Semantic helpers: ok / err / warn / info / bold / reset.
+if [[ -t 1 ]]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_MAGENTA=$'\033[35m'
+    C_CYAN=$'\033[36m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+fi
+
+ok()   { printf "${C_GREEN}OK${C_RESET}: %s\n" "$*"; }
+err()  { printf "${C_RED}ERROR${C_RESET}: %s\n" "$*" >&2; }
+warn() { printf "${C_YELLOW}WARNING${C_RESET}: %s\n" "$*"; }
+info() { printf "${C_BLUE}%s${C_RESET}\n" "$*"; }
+bold() { printf "${C_BOLD}%s${C_RESET}\n" "$*"; }
+
 # --- ensure_unmounted <dev> -----------------------------------------------
 # Offer to unmount any partitions on $1 (a whole disk) before we read/write it.
 # Returns 0 if no mounts remain after the prompt, 1 if some are still mounted.
@@ -30,11 +53,11 @@ ensure_unmounted() {
     fi
 
     echo ""
-    echo "The following partitions on $dev are currently mounted:"
+    info "The following partitions on ${C_BOLD}$dev${C_RESET} are currently mounted:"
     local m; for m in "${mps[@]}"; do printf "  %s\n" "$m"; done
     read -rp "Unmount them now? (y/n): " UNMOUNT_ANSWER
     if [[ ! "$UNMOUNT_ANSWER" =~ ^[Yy]$ ]]; then
-        echo "Leaving partitions mounted."
+        warn "Leaving partitions mounted."
         return 1
     fi
 
@@ -42,9 +65,9 @@ ensure_unmounted() {
     for m in "${mps[@]}"; do
         # The mountpoint may be a bind/loop path; unmount the device itself.
         if umount "$m" 2>/dev/null; then
-            echo "Unmounted $m."
+            ok "Unmounted $m."
         else
-            echo "Could not unmount $m (in use or permission denied)."
+            warn "Could not unmount $m (in use or permission denied)."
             ok=1
         fi
     done
@@ -64,19 +87,21 @@ pick_archive() {
 
     if [[ ${#FOUND_FILES[@]} -gt 0 ]]; then
         echo ""
-        echo "Found the following backup files:"
+        info "Found the following backup files:"
         echo "------------------------------------------------------------------------"
         for i in "${!FOUND_FILES[@]}"; do
             FILE_PATH="${FOUND_FILES[$i]}"
             FILE_SIZE=$(du -h "$FILE_PATH" 2>/dev/null | cut -f1)
             FILE_DATE=$(date -r "$FILE_PATH" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown date")
-            printf "  [%d] %s (%s, %s)\n" "$((i + 1))" "$FILE_PATH" "$FILE_SIZE" "$FILE_DATE"
+            printf "  ${C_BOLD}[%d]${C_RESET} %s (%s, %s)\n" "$((i + 1))" "$FILE_PATH" "$FILE_SIZE" "$FILE_DATE"
         done
         echo "  [0] Enter a custom file path manually"
         echo "------------------------------------------------------------------------"
 
+        # Strip any trailing colon from the label so we don't get "::" in the prompt.
+        local clean_label="${prompt_label%:}"
         while true; do
-            read -rp "${prompt_label}: " CHOICE
+            read -rp "${clean_label}: " CHOICE
             if [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
                 if [[ "$CHOICE" -eq 0 ]]; then
                     read -rp "Enter the full path to the backup .7z file: " SRC_ARCHIVE
@@ -86,15 +111,15 @@ pick_archive() {
                     break
                 fi
             fi
-            echo "Invalid selection. Please enter a number from the list above."
+            warn "Invalid selection. Please enter a number from the list above."
         done
     else
-        echo "No .7z backup files found in the current folder."
+        warn "No .7z backup files found in the current folder."
         read -rp "Enter the full path to the backup .7z file: " SRC_ARCHIVE
     fi
 
     if [[ ! -f "$SRC_ARCHIVE" ]]; then
-        echo "Error: File '$SRC_ARCHIVE' not found."
+        err "File '$SRC_ARCHIVE' not found."
         return 1
     fi
 }

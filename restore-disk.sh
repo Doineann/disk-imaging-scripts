@@ -19,9 +19,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
 # GPT's LBA0..LBA33 (512 B sectors) and MBR. 8 MiB covers both comfortably.
 PREFLIGHT_HEAD_MIB=8
 
+echo ""
 echo "========================================"
-echo "       FULL DISK RESTORE (7z + dd)      "
+bold "       FULL DISK RESTORE (7z + dd)      "
 echo "========================================"
+echo ""
 
 pick_archive "Select a backup to restore:"
 

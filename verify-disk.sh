@@ -15,9 +15,11 @@ done
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
 
+echo ""
 echo "========================================"
-echo "           DISK VERIFICATION            "
+bold "           DISK VERIFICATION            "
 echo "========================================"
+echo ""
 
 pick_archive "Select a backup to verify:"
 
@@ -102,5 +104,5 @@ fi
 
 echo ""
 echo "========================================"
-echo "  ALL CHECKS PASSED: DISK MATCHES IMAGE "
+bold "  ALL CHECKS PASSED: DISK MATCHES IMAGE "
 echo "========================================"

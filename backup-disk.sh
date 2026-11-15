@@ -2,13 +2,13 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-    echo "Error: This script must be run as root (use sudo)."
+    err "This script must be run as root (use sudo)."
     exit 1
 fi
 
 for cmd in dd 7z lsblk blockdev sha256sum tee; do
     if ! command -v "$cmd" &>/dev/null; then
-        echo "Error: Required command '$cmd' is not installed."
+        err "Required command '$cmd' is not installed."
         exit 1
     fi
 done
@@ -51,16 +51,18 @@ trap cleanup_on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+echo ""
 echo "========================================"
-echo "  FULL DISK BACKUP (dd + 7z + SHA256)   "
+bold "  FULL DISK BACKUP (dd + 7z + SHA256)   "
 echo "========================================"
-echo "Available drives:"
+echo ""
+info "Available drives:"
 lsblk -o NAME,SIZE,MODEL,TRAN,FSTYPE,LABEL,MOUNTPOINT
 echo "----------------------------------------"
 
 read -rp "Enter the SOURCE drive to back up (e.g., /dev/nvme0n1 or /dev/sda): " SRC_DRIVE
 if [[ ! -b "$SRC_DRIVE" ]]; then
-    echo "Error: '$SRC_DRIVE' is not a valid block device."
+    err "'$SRC_DRIVE' is not a valid block device."
     exit 1
 fi
 
@@ -69,7 +71,7 @@ if ! ensure_unmounted "$SRC_DRIVE"; then
     echo ""
     read -rp "One or more partitions are still mounted. Continue reading anyway? (y/n): " MOUNT_CONFIRM
     if [[ ! "$MOUNT_CONFIRM" =~ ^[Yy]$ ]]; then
-        echo "Aborted."
+        warn "Aborted."
         exit 1
     fi
 fi
@@ -82,7 +84,7 @@ if [[ ! -d "$DEST_DIR" ]]; then
     if [[ "$CREATE_DIR" =~ ^[Yy]$ ]]; then
         mkdir -p -- "$DEST_DIR"
     else
-        echo "Aborted."
+        warn "Aborted."
         exit 1
     fi
 fi
@@ -95,7 +97,7 @@ RAW_HASH_FILE="${DEST_FILE}.raw.sha256"
 ARCHIVE_HASH_FILE="${DEST_FILE}.sha256"
 
 if [[ -e "$DEST_FILE" ]]; then
-    echo "Error: Destination file '$DEST_FILE' already exists. Aborting."
+    err "Destination file '$DEST_FILE' already exists. Aborting."
     exit 1
 fi
 
@@ -103,14 +105,14 @@ DRIVE_BYTES=$(blockdev --getsize64 "$SRC_DRIVE")
 DRIVE_GB=$(awk "BEGIN {printf \"%.2f\", $DRIVE_BYTES / (1024^3)}")
 
 echo ""
-echo "================ SUMMARY ================"
-echo "Source Drive      : $SRC_DRIVE (${DRIVE_GB} GiB - $(lsblk -dn -o MODEL "$SRC_DRIVE"))"
+bold "================ SUMMARY ================"
+echo "Source Drive      : ${C_BOLD}$SRC_DRIVE${C_RESET} (${DRIVE_GB} GiB - $(lsblk -dn -o MODEL "$SRC_DRIVE"))"
 echo "Destination File  : $DEST_FILE"
 echo "Checksums         : Raw Disk SHA-256 + Compressed Archive SHA-256"
-echo "========================================="
+bold "========================================="
 read -rp "Start backup? (y/n): " CONFIRM
 if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo "Backup cancelled."
+    warn "Backup cancelled."
     exit 0
 fi
 
@@ -124,7 +126,7 @@ if [[ -n "$PASS1" ]]; then
     read -rsp "Re-enter backup password: " PASS2
     echo
     if [[ "$PASS1" != "$PASS2" ]]; then
-        echo "Error: Passwords did not match. Aborting."
+        err "Passwords did not match. Aborting."
         exit 1
     fi
 fi
@@ -135,11 +137,11 @@ PW_ARG=()
 
 echo ""
 if [[ -n "$PASS1" ]]; then
-    echo "Backing up $DRIVE_GB GiB and computing raw SHA-256 on the fly (encrypted)..."
+    info "Backing up ${C_BOLD}$DRIVE_GB GiB${C_RESET} and computing raw SHA-256 on the fly (encrypted)..."
 else
-    echo "Backing up $DRIVE_GB GiB and computing raw SHA-256 on the fly (unencrypted)..."
+    info "Backing up ${C_BOLD}$DRIVE_GB GiB${C_RESET} and computing raw SHA-256 on the fly (unencrypted)..."
 fi
-echo "Do NOT interrupt or power off."
+warn "Do NOT interrupt or power off."
 
 # The raw-hash file is created at pipeline start (by the tee branch), so track + chown it
 # as soon as it exists — not only at the end.
@@ -157,18 +159,18 @@ track_file "$DEST_FILE"
 chown_backup "$DEST_FILE"
 
 echo ""
-echo "Flushing buffers to disk..."
+info "Flushing buffers to disk..."
 sync
 
-echo "Generating compressed archive SHA-256 checksum..."
+info "Generating compressed archive SHA-256 checksum..."
 (cd "$(dirname "$DEST_FILE")" && sha256sum "$(basename "$DEST_FILE")" > "$ARCHIVE_HASH_FILE")
 track_file "$ARCHIVE_HASH_FILE"
 chown_backup "$ARCHIVE_HASH_FILE"
 
 FINAL_SIZE=$(du -h "$DEST_FILE" | cut -f1)
 echo ""
-echo "Backup completed successfully!"
-echo "Archive           : $DEST_FILE ($FINAL_SIZE)"
+ok "Backup completed successfully!"
+echo "Archive           : ${C_BOLD}$DEST_FILE${C_RESET} ($FINAL_SIZE)"
 echo "Raw Disk SHA-256  : $(awk '{print $1}' "$RAW_HASH_FILE")"
 echo "Archive SHA-256   : $(awk '{print $1}' "$ARCHIVE_HASH_FILE")"
 echo "Owned by          : ${OWNER_NAME}:${OWNER_GROUP}"

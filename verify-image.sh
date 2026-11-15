@@ -10,9 +10,11 @@ done
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
 
+echo ""
 echo "========================================"
-echo "        BACKUP INTEGRITY VERIFIER       "
+bold "        BACKUP INTEGRITY VERIFIER       "
 echo "========================================"
+echo ""
 
 pick_archive "Select a backup to verify:"
 
@@ -88,5 +90,5 @@ fi
 
 echo ""
 echo "========================================"
-echo "  ALL CHECKS PASSED: BACKUP IS HEALTHY  "
+bold "  ALL CHECKS PASSED: BACKUP IS HEALTHY  "
 echo "========================================"
