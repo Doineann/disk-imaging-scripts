@@ -5,10 +5,7 @@ set -euo pipefail
 # leftover may be a bit more or less than this — that's fine).
 RESERVE_BYTES=$((1024 * 1024 * 64))   # ~64 MiB
 
-# Block size for dd. Larger blocks cut syscall overhead on fast media (modern SSDs
-# can sustain ~10 GB/s), but each dd allocates one buffer of this size, so keep it
-# modest to bound memory use across the pipeline. 64 MiB is a good balance.
-DD_BS=64M
+source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
 DD_BS_BYTES=$((64 * 1024 * 1024))
 
 BASE_WORK="/run/wipe-free-space.$$"
@@ -77,7 +74,7 @@ wipe_free_on_mounted() {
 
         ok=0
         if command -v pv &>/dev/null; then
-            dd if=/dev/zero bs=$DD_BS count="$blocks" status=none | pv -s $(( blocks * DD_BS_BYTES )) > "$f" || ok=$?
+            dd if=/dev/zero bs=$DD_BS count="$blocks" status=none | pv -s $(( blocks * DD_BS_BYTES )) "${PV_OPTS[@]}" > "$f" || ok=$?
         else
             dd if=/dev/zero of="$f" bs=$DD_BS count="$blocks" status=progress || ok=$?
         fi

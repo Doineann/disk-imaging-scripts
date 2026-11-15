@@ -13,10 +13,7 @@ for cmd in dd 7z lsblk blockdev sha256sum tee; do
     fi
 done
 
-# Block size for dd. Larger blocks cut syscall overhead on fast media (modern SSDs
-# can sustain ~10 GB/s), but each dd allocates one buffer of this size, so keep it
-# modest to bound memory use across the pipeline. 64 MiB is a good balance.
-DD_BS=64M
+source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
 
 # Resolve the human user who invoked us via sudo, so we can hand ownership of the
 # backup files back to them (the script itself runs as root). Prefer $SUDO_USER;
@@ -53,41 +50,6 @@ track_file() { [[ -n "${1:-}" ]] && CREATED=1 CLEANUP_FILES+=("$1"); }
 trap cleanup_on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-
-# Offer to unmount any partitions on $1 (a whole disk) before we read/write it.
-# Returns 0 if no mounts remain after the prompt, 1 if some are still mounted.
-ensure_unmounted() {
-    local dev="$1"
-    # Collect the mountpoints of this disk's partitions that are currently mounted.
-    local mps=() mp
-    while IFS= read -r mp; do
-        [[ -n "$mp" ]] && mps+=("$mp")
-    done < <(lsblk -no MOUNTPOINT "$dev" | grep -v '^$')
-    if [[ ${#mps[@]} -eq 0 ]]; then
-        return 0
-    fi
-
-    echo ""
-    echo "The following partitions on $dev are currently mounted:"
-    local m; for m in "${mps[@]}"; do printf "  %s\n" "$m"; done
-    read -rp "Unmount them now? (y/n): " UNMOUNT_ANSWER
-    if [[ ! "$UNMOUNT_ANSWER" =~ ^[Yy]$ ]]; then
-        echo "Leaving partitions mounted."
-        return 1
-    fi
-
-    local ok=0 m2
-    for m in "${mps[@]}"; do
-        # The mountpoint may be a bind/loop path; unmount the device itself.
-        if umount "$m" 2>/dev/null; then
-            echo "Unmounted $m."
-        else
-            echo "Could not unmount $m (in use or permission denied)."
-            ok=1
-        fi
-    done
-    return $ok
-}
 
 echo "========================================"
 echo "  FULL DISK BACKUP (dd + 7z + SHA256)   "
@@ -185,7 +147,7 @@ touch "$RAW_HASH_FILE"; track_file "$RAW_HASH_FILE"
 chown_backup "$RAW_HASH_FILE"
 
 if command -v pv &>/dev/null; then
-    dd if="$SRC_DRIVE" bs=$DD_BS status=none | pv -s "$DRIVE_BYTES" -w 63 --format '%b %p %r' | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
+    dd if="$SRC_DRIVE" bs=$DD_BS status=none | pv -s "$DRIVE_BYTES" "${PV_OPTS[@]}" | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
 else
     dd if="$SRC_DRIVE" bs=$DD_BS status=progress | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
 fi

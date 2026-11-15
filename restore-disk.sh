@@ -13,90 +13,17 @@ for cmd in dd 7z lsblk blockdev find du date; do
     fi
 done
 
-# Block size for dd. Larger blocks cut syscall overhead on fast media (modern SSDs
-# can sustain ~10 GB/s), but each dd allocates one buffer of this size, so keep it
-# modest to bound memory use across the pipeline. 64 MiB is a good balance.
-DD_BS=64M
+source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
 
 # How many MiB of the image head to extract during pre-flight, just enough to reach
 # GPT's LBA0..LBA33 (512 B sectors) and MBR. 8 MiB covers both comfortably.
 PREFLIGHT_HEAD_MIB=8
 
-# Offer to unmount any partitions on $1 (a whole disk) before we write to it.
-# Returns 0 if no mounts remain after the prompt, 1 if some are still mounted.
-ensure_unmounted() {
-    local dev="$1"
-    # Collect the mountpoints of this disk's partitions that are currently mounted.
-    local mps=() mp
-    while IFS= read -r mp; do
-        [[ -n "$mp" ]] && mps+=("$mp")
-    done < <(lsblk -no MOUNTPOINT "$dev" | grep -v '^$')
-    if [[ ${#mps[@]} -eq 0 ]]; then
-        return 0
-    fi
-
-    echo ""
-    echo "The following partitions on $dev are currently mounted:"
-    local m; for m in "${mps[@]}"; do printf "  %s\n" "$m"; done
-    read -rp "Unmount them now? (y/n): " UNMOUNT_ANSWER
-    if [[ ! "$UNMOUNT_ANSWER" =~ ^[Yy]$ ]]; then
-        echo "Leaving partitions mounted."
-        return 1
-    fi
-
-    local ok=0 m2
-    for m in "${mps[@]}"; do
-        # The mountpoint may be a bind/loop path; unmount the device itself.
-        if umount "$m" 2>/dev/null; then
-            echo "Unmounted $m."
-        else
-            echo "Could not unmount $m (in use or permission denied)."
-            ok=1
-        fi
-    done
-    return $ok
-}
-
 echo "========================================"
 echo "       FULL DISK RESTORE (7z + dd)      "
 echo "========================================"
 
-echo "Searching current folder for backup archives (*.img.7z / *.7z)..."
-
-mapfile -t FOUND_FILES < <(find . -maxdepth 2 -type f \( -name "*.img.7z" -o -name "*.7z" \) 2>/dev/null | sed 's|^\./||' | sort)
-
-SRC_ARCHIVE=""
-
-if [[ ${#FOUND_FILES[@]} -gt 0 ]]; then
-    echo ""
-    echo "Found the following backup files:"
-    echo "------------------------------------------------------------------------"
-    for i in "${!FOUND_FILES[@]}"; do
-        FILE_PATH="${FOUND_FILES[$i]}"
-        FILE_SIZE=$(du -h "$FILE_PATH" 2>/dev/null | cut -f1)
-        FILE_DATE=$(date -r "$FILE_PATH" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown date")
-        printf "  [%d] %s (%s, %s)\n" "$((i + 1))" "$FILE_PATH" "$FILE_SIZE" "$FILE_DATE"
-    done
-    echo "  [0] Enter a custom file path manually"
-    echo "------------------------------------------------------------------------"
-
-    while true; do
-        read -rp "Select a backup to restore: " CHOICE
-        if [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
-            if [[ "$CHOICE" -eq 0 ]]; then
-                read -rp "Enter the full path to the backup .7z file: " SRC_ARCHIVE
-                break
-            elif [[ "$CHOICE" -ge 1 && "$CHOICE" -le ${#FOUND_FILES[@]} ]]; then
-                SRC_ARCHIVE="${FOUND_FILES[$((CHOICE - 1))]}"
-                break
-            fi
-        fi
-        echo "Invalid selection. Please enter a number from the list above."
-    done
-else
-    echo "No .7z backup files found in the current folder."
-    read -rp "Enter the full path to the backup .7z file: " SRC_ARCHIVE
-fi
+pick_archive "Select a backup to restore:"
 
 if [[ ! -f "$SRC_ARCHIVE" ]]; then
     echo "Error: File '$SRC_ARCHIVE' not found."
@@ -208,7 +135,7 @@ echo "Restoring image... Do NOT interrupt or power off."
 # Stream-decode straight to the target drive (no temp file). -bso0/-bsp0 keep 7z from
 # clobbering dd's progress line; pv shows throughput against the known total size.
 if command -v pv &>/dev/null && [[ -n "$UNCOMPRESSED_BYTES" ]]; then
-    7z x -so -p"$PASS" -bso0 -bsp0 "$SRC_ARCHIVE" | pv -s "$UNCOMPRESSED_BYTES" -w 63 --format '%b %p %r' | dd of="$DEST_DRIVE" bs=$DD_BS status=none iflag=fullblock oflag=direct
+    7z x -so -p"$PASS" -bso0 -bsp0 "$SRC_ARCHIVE" | pv -s "$UNCOMPRESSED_BYTES" "${PV_OPTS[@]}" | dd of="$DEST_DRIVE" bs=$DD_BS status=none iflag=fullblock oflag=direct
 else
     7z x -so -p"$PASS" -bso0 -bsp0 "$SRC_ARCHIVE" | dd of="$DEST_DRIVE" bs=$DD_BS status=progress iflag=fullblock oflag=direct
 fi

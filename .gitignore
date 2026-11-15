@@ -1,4 +1,6 @@
 *
+!lib/
+!lib/shared.sh
 !backup-disk.sh
 !restore-disk.sh
 !verify-disk.sh

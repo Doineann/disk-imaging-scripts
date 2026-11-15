@@ -13,85 +13,13 @@ for cmd in 7z sha256sum find du date dd awk lsblk blockdev; do
     fi
 done
 
-# Block size for dd. Larger blocks cut syscall overhead on fast media (modern SSDs
-# can sustain ~10 GB/s), but each dd allocates one buffer of this size, so keep it
-# modest to bound memory use across the pipeline. 64 MiB is a good balance.
-DD_BS=64M
-
-# Offer to unmount any partitions on $1 (a whole disk) before we read from it.
-# Returns 0 if no mounts remain after the prompt, 1 if some are still mounted.
-ensure_unmounted() {
-    local dev="$1"
-    # Collect the mountpoints of this disk's partitions that are currently mounted.
-    local mps=() mp
-    while IFS= read -r mp; do
-        [[ -n "$mp" ]] && mps+=("$mp")
-    done < <(lsblk -no MOUNTPOINT "$dev" | grep -v '^$')
-    if [[ ${#mps[@]} -eq 0 ]]; then
-        return 0
-    fi
-
-    echo ""
-    echo "The following partitions on $dev are currently mounted:"
-    local m; for m in "${mps[@]}"; do printf "  %s\n" "$m"; done
-    read -rp "Unmount them now? (y/n): " UNMOUNT_ANSWER
-    if [[ ! "$UNMOUNT_ANSWER" =~ ^[Yy]$ ]]; then
-        echo "Leaving partitions mounted."
-        return 1
-    fi
-
-    local ok=0 m2
-    for m in "${mps[@]}"; do
-        # The mountpoint may be a bind/loop path; unmount the device itself.
-        if umount "$m" 2>/dev/null; then
-            echo "Unmounted $m."
-        else
-            echo "Could not unmount $m (in use or permission denied)."
-            ok=1
-        fi
-    done
-    return $ok
-}
+source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
 
 echo "========================================"
 echo "           DISK VERIFICATION            "
 echo "========================================"
-echo "Searching current folder for backup archives (*.img.7z / *.7z)..."
 
-mapfile -t FOUND_FILES < <(find . -maxdepth 2 -type f \( -name "*.img.7z" -o -name "*.7z" \) 2>/dev/null | sed 's|^\./||' | sort)
-
-SRC_ARCHIVE=""
-
-if [[ ${#FOUND_FILES[@]} -gt 0 ]]; then
-    echo ""
-    echo "Found the following backup files:"
-    echo "------------------------------------------------------------------------"
-    for i in "${!FOUND_FILES[@]}"; do
-        FILE_PATH="${FOUND_FILES[$i]}"
-        FILE_SIZE=$(du -h "$FILE_PATH" 2>/dev/null | cut -f1)
-        FILE_DATE=$(date -r "$FILE_PATH" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown date")
-        printf "  [%d] %s (%s, %s)\n" "$((i + 1))" "$FILE_PATH" "$FILE_SIZE" "$FILE_DATE"
-    done
-    echo "  [0] Enter a custom file path manually"
-    echo "------------------------------------------------------------------------"
-
-    while true; do
-        read -rp "Select a backup to verify: " CHOICE
-        if [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
-            if [[ "$CHOICE" -eq 0 ]]; then
-                read -rp "Enter the full path to the backup .7z file: " SRC_ARCHIVE
-                break
-            elif [[ "$CHOICE" -ge 1 && "$CHOICE" -le ${#FOUND_FILES[@]} ]]; then
-                SRC_ARCHIVE="${FOUND_FILES[$((CHOICE - 1))]}"
-                break
-            fi
-        fi
-        echo "Invalid selection. Please enter a number from the list above."
-    done
-else
-    echo "No .7z backup files found in the current folder."
-    read -rp "Enter the full path to the backup .7z file: " SRC_ARCHIVE
-fi
+pick_archive "Select a backup to verify:"
 
 if [[ ! -f "$SRC_ARCHIVE" ]]; then
     echo "Error: File '$SRC_ARCHIVE' not found."
@@ -100,11 +28,6 @@ fi
 
 echo ""
 echo "Selected: $SRC_ARCHIVE"
-
-# Unbuffered on-the-fly replacement of "copied" with "verified"
-dd_verify() {
-    dd "$@" bs=$DD_BS status=progress 2> >(awk 'BEGIN{RS="\r|\n"} NF{gsub(/copied/, "verified"); printf "\r\033[K%s", $0 > "/dev/stderr"; fflush("/dev/stderr")} END{printf "\n" > "/dev/stderr"}')
-}
 
 # Exact number of bytes in the image (we only ever compare that many)
 IMAGE_BYTES=$(7z l -slt "$SRC_ARCHIVE" 2>/dev/null | awk -F' = ' '/^Size = /{print $2; exit}')
@@ -154,7 +77,7 @@ echo
 echo ""
 echo "[1/2] Extracting image stream and computing its SHA-256..."
 if command -v pv &>/dev/null; then
-    COMPUTED_IMAGE_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$IMAGE_BYTES" -w 63 --format '%b %p %r' | sha256sum | awk '{print $1}')
+    COMPUTED_IMAGE_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$IMAGE_BYTES" "${PV_OPTS[@]}" | sha256sum | awk '{print $1}')
 else
     COMPUTED_IMAGE_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | dd_verify | sha256sum | awk '{print $1}')
 fi
@@ -163,7 +86,7 @@ fi
 echo ""
 echo "[2/2] Reading $DEST_DRIVE and computing its SHA-256..."
 if command -v pv &>/dev/null; then
-    COMPUTED_DISK_HASH=$(dd if="$DEST_DRIVE" bs=$DD_BS count="$IMAGE_BYTES" iflag=count_bytes status=none | pv -s "$IMAGE_BYTES" -w 63 --format '%b %p %r' | sha256sum | awk '{print $1}')
+    COMPUTED_DISK_HASH=$(dd if="$DEST_DRIVE" bs=$DD_BS count="$IMAGE_BYTES" iflag=count_bytes status=none | pv -s "$IMAGE_BYTES" "${PV_OPTS[@]}" | sha256sum | awk '{print $1}')
 else
     COMPUTED_DISK_HASH=$(dd if="$DEST_DRIVE" bs=$DD_BS count="$IMAGE_BYTES" iflag=count_bytes status=none 2>/dev/null | dd_verify | sha256sum | awk '{print $1}')
 fi
