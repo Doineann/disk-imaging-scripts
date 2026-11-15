@@ -3,3 +3,4 @@
 !restore-disk.sh
 !verify-disk.sh
 !verify-image.sh
+!zero-clear-free-space.sh
