@@ -1,4 +1,5 @@
 *
 !backup-disk.sh
 !restore-disk.sh
+!verify-disk.sh
 !verify-image.sh
