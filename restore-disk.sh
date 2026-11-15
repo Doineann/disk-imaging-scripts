@@ -71,9 +71,9 @@ echo "Restoring image... Do NOT interrupt or power off."
 
 # -bso0 -bsp0 prevents 7z from overwriting dd's progress line
 if command -v pv &>/dev/null && [[ -n "$UNCOMPRESSED_BYTES" ]]; then
-    7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$UNCOMPRESSED_BYTES" | dd of="$DEST_DRIVE" bs=4M status=none oflag=direct
+    7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$UNCOMPRESSED_BYTES" | dd of="$DEST_DRIVE" bs=4M status=none iflag=fullblock oflag=direct
 else
-    7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | dd of="$DEST_DRIVE" bs=4M status=progress oflag=direct
+    7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | dd of="$DEST_DRIVE" bs=4M status=progress iflag=fullblock oflag=direct
 fi
 
 echo ""
