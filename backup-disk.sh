@@ -17,7 +17,7 @@ echo "========================================"
 echo "  FULL DISK BACKUP (dd + 7z + SHA256)   "
 echo "========================================"
 echo "Available drives:"
-lsblk -d -o NAME,SIZE,MODEL,TRAN
+lsblk -o NAME,SIZE,MODEL,TRAN,FSTYPE,LABEL,MOUNTPOINT
 echo "----------------------------------------"
 
 read -rp "Enter the SOURCE drive to back up (e.g., /dev/nvme0n1 or /dev/sda): " SRC_DRIVE

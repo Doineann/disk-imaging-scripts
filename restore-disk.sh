@@ -28,7 +28,7 @@ UNCOMPRESSED_BYTES=$(7z l -slt "$SRC_ARCHIVE" 2>/dev/null | awk -F' = ' '/^Size 
 
 echo ""
 echo "Available target drives:"
-lsblk -d -o NAME,SIZE,MODEL,TRAN
+lsblk -o NAME,SIZE,MODEL,TRAN,FSTYPE,LABEL,MOUNTPOINT
 echo "----------------------------------------"
 
 read -rp "Enter the TARGET drive to overwrite (e.g., /dev/nvme0n1 or /dev/sda): " DEST_DRIVE
