@@ -13,6 +13,46 @@ for cmd in 7z sha256sum find du date dd awk lsblk blockdev; do
     fi
 done
 
+# Block size for dd. Larger blocks cut syscall overhead on fast media (modern SSDs
+# can sustain ~10 GB/s), but each dd allocates one buffer of this size, so keep it
+# modest to bound memory use across the pipeline. 64 MiB is a good balance.
+DD_BS=64M
+
+# Offer to unmount any partitions on $1 (a whole disk) before we read from it.
+# Returns 0 if no mounts remain after the prompt, 1 if some are still mounted.
+ensure_unmounted() {
+    local dev="$1"
+    # Collect the mountpoints of this disk's partitions that are currently mounted.
+    local mps=() mp
+    while IFS= read -r mp; do
+        [[ -n "$mp" ]] && mps+=("$mp")
+    done < <(lsblk -no MOUNTPOINT "$dev" | grep -v '^$')
+    if [[ ${#mps[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    echo ""
+    echo "The following partitions on $dev are currently mounted:"
+    local m; for m in "${mps[@]}"; do printf "  %s\n" "$m"; done
+    read -rp "Unmount them now? (y/n): " UNMOUNT_ANSWER
+    if [[ ! "$UNMOUNT_ANSWER" =~ ^[Yy]$ ]]; then
+        echo "Leaving partitions mounted."
+        return 1
+    fi
+
+    local ok=0 m2
+    for m in "${mps[@]}"; do
+        # The mountpoint may be a bind/loop path; unmount the device itself.
+        if umount "$m" 2>/dev/null; then
+            echo "Unmounted $m."
+        else
+            echo "Could not unmount $m (in use or permission denied)."
+            ok=1
+        fi
+    done
+    return $ok
+}
+
 echo "========================================"
 echo "           DISK VERIFICATION            "
 echo "========================================"
@@ -63,7 +103,7 @@ echo "Selected: $SRC_ARCHIVE"
 
 # Unbuffered on-the-fly replacement of "copied" with "verified"
 dd_verify() {
-    dd "$@" bs=4M status=progress 2> >(awk 'BEGIN{RS="\r|\n"} NF{gsub(/copied/, "verified"); printf "\r\033[K%s", $0 > "/dev/stderr"; fflush("/dev/stderr")} END{printf "\n" > "/dev/stderr"}')
+    dd "$@" bs=$DD_BS status=progress 2> >(awk 'BEGIN{RS="\r|\n"} NF{gsub(/copied/, "verified"); printf "\r\033[K%s", $0 > "/dev/stderr"; fflush("/dev/stderr")} END{printf "\n" > "/dev/stderr"}')
 }
 
 # Exact number of bytes in the image (we only ever compare that many)
@@ -90,32 +130,42 @@ if [[ "$IMAGE_BYTES" -gt "$TARGET_BYTES" ]]; then
     exit 1
 fi
 
-if lsblk -no MOUNTPOINT "$DEST_DRIVE" | grep -q -v '^$'; then
+# Reading a live disk may yield changing data and a spurious mismatch — offer to unmount.
+if ! ensure_unmounted "$DEST_DRIVE"; then
     echo ""
-    echo "Warning: One or more partitions on $DEST_DRIVE are currently mounted."
-    echo "Reading a live disk may yield changing data and a spurious mismatch."
+    read -rp "One or more partitions are still mounted. Continue reading anyway? (y/n): " MOUNT_CONFIRM
+    if [[ ! "$MOUNT_CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 1
+    fi
 fi
 
 echo ""
 echo "Verifying $DEST_DRIVE against the image (first $IMAGE_BYTES bytes only)..."
 echo "Do NOT interrupt or power off."
 
+# Encrypted (PFS) backups need a password to decode. Bare `-p` can't be used: 7z's stdin is
+# a pipe here, so it cannot open /dev/tty to prompt (E_INVALIDARG). Read explicitly; blank
+# is fine for unencrypted archives.
+read -rsp "Enter backup password (blank if none): " PASS
+echo
+
 # 1. SHA-256 of the extracted image data (exactly IMAGE_BYTES)
 echo ""
 echo "[1/2] Extracting image stream and computing its SHA-256..."
 if command -v pv &>/dev/null; then
-    COMPUTED_IMAGE_HASH=$(7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$IMAGE_BYTES" | sha256sum | awk '{print $1}')
+    COMPUTED_IMAGE_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$IMAGE_BYTES" -w 63 --format '%b %p %r' | sha256sum | awk '{print $1}')
 else
-    COMPUTED_IMAGE_HASH=$(7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | dd_verify | sha256sum | awk '{print $1}')
+    COMPUTED_IMAGE_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | dd_verify | sha256sum | awk '{print $1}')
 fi
 
 # 2. SHA-256 of the first IMAGE_BYTES bytes read from the target drive
 echo ""
 echo "[2/2] Reading $DEST_DRIVE and computing its SHA-256..."
 if command -v pv &>/dev/null; then
-    COMPUTED_DISK_HASH=$(dd if="$DEST_DRIVE" bs=4M count="$IMAGE_BYTES" iflag=count_bytes status=none | pv -s "$IMAGE_BYTES" | sha256sum | awk '{print $1}')
+    COMPUTED_DISK_HASH=$(dd if="$DEST_DRIVE" bs=$DD_BS count="$IMAGE_BYTES" iflag=count_bytes status=none | pv -s "$IMAGE_BYTES" -w 63 --format '%b %p %r' | sha256sum | awk '{print $1}')
 else
-    COMPUTED_DISK_HASH=$(dd if="$DEST_DRIVE" bs=4M count="$IMAGE_BYTES" iflag=count_bytes status=none 2>/dev/null | dd_verify | sha256sum | awk '{print $1}')
+    COMPUTED_DISK_HASH=$(dd if="$DEST_DRIVE" bs=$DD_BS count="$IMAGE_BYTES" iflag=count_bytes status=none 2>/dev/null | dd_verify | sha256sum | awk '{print $1}')
 fi
 
 if [[ "$COMPUTED_IMAGE_HASH" == "$COMPUTED_DISK_HASH" ]]; then

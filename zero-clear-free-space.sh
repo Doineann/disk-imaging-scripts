@@ -5,6 +5,12 @@ set -euo pipefail
 # leftover may be a bit more or less than this — that's fine).
 RESERVE_BYTES=$((1024 * 1024 * 64))   # ~64 MiB
 
+# Block size for dd. Larger blocks cut syscall overhead on fast media (modern SSDs
+# can sustain ~10 GB/s), but each dd allocates one buffer of this size, so keep it
+# modest to bound memory use across the pipeline. 64 MiB is a good balance.
+DD_BS=64M
+DD_BS_BYTES=$((64 * 1024 * 1024))
+
 BASE_WORK="/run/wipe-free-space.$$"
 CURRENT_MP=""
 CURRENT_TMP=""
@@ -56,7 +62,7 @@ wipe_free_on_mounted() {
         rem=$(( target - written ))
         want=$rem
         if (( maxfile > 0 )) && (( rem > maxfile )); then want=$maxfile; fi
-        blocks=$(( want / (4 * 1024 * 1024) ))          # bs=4M, whole blocks (loose)
+        blocks=$(( want / DD_BS_BYTES ))                # whole DD_BS-sized blocks (loose)
         if (( blocks < 1 )); then break; fi
 
         f="$tmpdir/zero_$(printf '%03d' "$idx")"
@@ -71,9 +77,9 @@ wipe_free_on_mounted() {
 
         ok=0
         if command -v pv &>/dev/null; then
-            dd if=/dev/zero bs=4M count="$blocks" status=none | pv -s $(( blocks * 4 * 1024 * 1024 )) > "$f" || ok=$?
+            dd if=/dev/zero bs=$DD_BS count="$blocks" status=none | pv -s $(( blocks * DD_BS_BYTES )) > "$f" || ok=$?
         else
-            dd if=/dev/zero of="$f" bs=4M count="$blocks" status=progress || ok=$?
+            dd if=/dev/zero of="$f" bs=$DD_BS count="$blocks" status=progress || ok=$?
         fi
         # A short final write just means the partition is full — that's what we want.
         if (( ok != 0 )); then break; fi
@@ -182,7 +188,7 @@ main() {
 
     echo ""
     echo "This will WRITE ~${total_gib} GiB of zeros (a full physical write of the free space)."
-    echo "It is a normal disk-wear operation and may take a while. Do NOT power off."
+    echo "It is a normal disk-wear operation and may take a while. Do NOT interrupt or power off."
     read -rp "Type 'WIPE' to continue: " CONFIRM
     if [[ "$CONFIRM" != "WIPE" ]]; then
         echo "Aborted."

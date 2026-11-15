@@ -13,6 +13,82 @@ for cmd in dd 7z lsblk blockdev sha256sum tee; do
     fi
 done
 
+# Block size for dd. Larger blocks cut syscall overhead on fast media (modern SSDs
+# can sustain ~10 GB/s), but each dd allocates one buffer of this size, so keep it
+# modest to bound memory use across the pipeline. 64 MiB is a good balance.
+DD_BS=64M
+
+# Resolve the human user who invoked us via sudo, so we can hand ownership of the
+# backup files back to them (the script itself runs as root). Prefer $SUDO_USER;
+# fall back to the effective user if that's unavailable.
+OWNER_UID="$(id -u)"
+if [[ -n "${SUDO_USER:-}" ]]; then
+    OWNER_NAME="$SUDO_USER"
+else
+    OWNER_NAME="$(id -un)"
+fi
+# Primary group of that user (for chown user:group).
+OWNER_GROUP="$(getent group "$OWNER_NAME" 2>/dev/null | cut -d: -f3 || true)"
+
+# Hand ownership of the produced backup files back to the invoking user.
+chown_backup() {
+    local f
+    for f in "$@"; do
+        [[ -e "$f" ]] && chown "${OWNER_NAME}:${OWNER_GROUP}" -- "$f" 2>/dev/null || true
+    done
+}
+
+# --- Cleanup on exit / interrupt: remove any artifacts THIS run created. ---
+# Only files we actually made are tracked (CREATED=1), so a pre-existing file is never
+# touched, and the trap is only armed after the user confirms "Start backup".
+CLEANUP_FILES=()
+cleanup_on_exit() {
+    local rc=$? f
+    # On success (rc==0) keep everything; on error/interrupt remove our artifacts.
+    if (( rc != 0 )); then
+        for f in "${CLEANUP_FILES[@]}"; do rm -f -- "$f" 2>/dev/null || true; done
+    fi
+}
+track_file() { [[ -n "${1:-}" ]] && CREATED=1 CLEANUP_FILES+=("$1"); }
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Offer to unmount any partitions on $1 (a whole disk) before we read/write it.
+# Returns 0 if no mounts remain after the prompt, 1 if some are still mounted.
+ensure_unmounted() {
+    local dev="$1"
+    # Collect the mountpoints of this disk's partitions that are currently mounted.
+    local mps=() mp
+    while IFS= read -r mp; do
+        [[ -n "$mp" ]] && mps+=("$mp")
+    done < <(lsblk -no MOUNTPOINT "$dev" | grep -v '^$')
+    if [[ ${#mps[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    echo ""
+    echo "The following partitions on $dev are currently mounted:"
+    local m; for m in "${mps[@]}"; do printf "  %s\n" "$m"; done
+    read -rp "Unmount them now? (y/n): " UNMOUNT_ANSWER
+    if [[ ! "$UNMOUNT_ANSWER" =~ ^[Yy]$ ]]; then
+        echo "Leaving partitions mounted."
+        return 1
+    fi
+
+    local ok=0 m2
+    for m in "${mps[@]}"; do
+        # The mountpoint may be a bind/loop path; unmount the device itself.
+        if umount "$m" 2>/dev/null; then
+            echo "Unmounted $m."
+        else
+            echo "Could not unmount $m (in use or permission denied)."
+            ok=1
+        fi
+    done
+    return $ok
+}
+
 echo "========================================"
 echo "  FULL DISK BACKUP (dd + 7z + SHA256)   "
 echo "========================================"
@@ -26,17 +102,23 @@ if [[ ! -b "$SRC_DRIVE" ]]; then
     exit 1
 fi
 
-if lsblk -no MOUNTPOINT "$SRC_DRIVE" | grep -q -v '^$'; then
-    echo "Warning: One or more partitions on $SRC_DRIVE are currently mounted!"
-    read -rp "Are you sure you want to continue anyway? (yes/no): " MOUNT_CONFIRM
-    [[ "$MOUNT_CONFIRM" != "yes" ]] && echo "Aborted." && exit 1
+if ! ensure_unmounted "$SRC_DRIVE"; then
+    # Reading a live disk may yield changing data; warn but allow the user to proceed.
+    echo ""
+    read -rp "One or more partitions are still mounted. Continue reading anyway? (y/n): " MOUNT_CONFIRM
+    if [[ ! "$MOUNT_CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 1
+    fi
 fi
 
 read -rp "Enter the DESTINATION folder path (e.g., /mnt/external_drive/backups): " DEST_DIR
+# An empty answer means "put it here" — default to the current working directory.
+DEST_DIR="${DEST_DIR:-$PWD}"
 if [[ ! -d "$DEST_DIR" ]]; then
     read -rp "Directory '$DEST_DIR' does not exist. Create it? (y/n): " CREATE_DIR
     if [[ "$CREATE_DIR" =~ ^[Yy]$ ]]; then
-        mkdir -p "$DEST_DIR"
+        mkdir -p -- "$DEST_DIR"
     else
         echo "Aborted."
         exit 1
@@ -64,20 +146,53 @@ echo "Source Drive      : $SRC_DRIVE (${DRIVE_GB} GiB - $(lsblk -dn -o MODEL "$S
 echo "Destination File  : $DEST_FILE"
 echo "Checksums         : Raw Disk SHA-256 + Compressed Archive SHA-256"
 echo "========================================="
-read -rp "Type 'BACKUP' to start cloning: " CONFIRM
-if [[ "$CONFIRM" != "BACKUP" ]]; then
+read -rp "Start backup? (y/n): " CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     echo "Backup cancelled."
     exit 0
 fi
 
+# Prompt for the backup password (hidden input). A BLANK answer means "no encryption" — we
+# don't fail, we just create an unencrypted archive. When a password IS given we confirm
+# it with a second read. Bare `-p` can't be used: in these pipelines 7z's stdin is a pipe,
+# so it cannot open /dev/tty to prompt (E_INVALIDARG); we pass the secret explicitly.
+read -rsp "Enter backup password (blank for none): " PASS1
+echo
+if [[ -n "$PASS1" ]]; then
+    read -rsp "Re-enter backup password: " PASS2
+    echo
+    if [[ "$PASS1" != "$PASS2" ]]; then
+        echo "Error: Passwords did not match. Aborting."
+        exit 1
+    fi
+fi
+
+# Build the 7z password argument: empty -> no -p (unencrypted), else -p"$PASS".
+PW_ARG=()
+[[ -n "$PASS1" ]] && PW_ARG=(-p"$PASS1")
+
 echo ""
-echo "Backing up $DRIVE_GB GiB and computing raw SHA-256 on the fly..."
+if [[ -n "$PASS1" ]]; then
+    echo "Backing up $DRIVE_GB GiB and computing raw SHA-256 on the fly (encrypted)..."
+else
+    echo "Backing up $DRIVE_GB GiB and computing raw SHA-256 on the fly (unencrypted)..."
+fi
+echo "Do NOT interrupt or power off."
+
+# The raw-hash file is created at pipeline start (by the tee branch), so track + chown it
+# as soon as it exists — not only at the end.
+touch "$RAW_HASH_FILE"; track_file "$RAW_HASH_FILE"
+chown_backup "$RAW_HASH_FILE"
 
 if command -v pv &>/dev/null; then
-    dd if="$SRC_DRIVE" bs=4M status=none | pv -s "$DRIVE_BYTES" | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 -bso0 -bsp0 -bse1 "$DEST_FILE"
+    dd if="$SRC_DRIVE" bs=$DD_BS status=none | pv -s "$DRIVE_BYTES" -w 63 --format '%b %p %r' | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
 else
-    dd if="$SRC_DRIVE" bs=4M status=progress | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 -bso0 -bsp0 -bse1 "$DEST_FILE"
+    dd if="$SRC_DRIVE" bs=$DD_BS status=progress | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
 fi
+
+# The archive now exists (possibly partial if interrupted) — track + chown it immediately.
+track_file "$DEST_FILE"
+chown_backup "$DEST_FILE"
 
 echo ""
 echo "Flushing buffers to disk..."
@@ -85,6 +200,8 @@ sync
 
 echo "Generating compressed archive SHA-256 checksum..."
 (cd "$(dirname "$DEST_FILE")" && sha256sum "$(basename "$DEST_FILE")" > "$ARCHIVE_HASH_FILE")
+track_file "$ARCHIVE_HASH_FILE"
+chown_backup "$ARCHIVE_HASH_FILE"
 
 FINAL_SIZE=$(du -h "$DEST_FILE" | cut -f1)
 echo ""
@@ -92,3 +209,4 @@ echo "Backup completed successfully!"
 echo "Archive           : $DEST_FILE ($FINAL_SIZE)"
 echo "Raw Disk SHA-256  : $(awk '{print $1}' "$RAW_HASH_FILE")"
 echo "Archive SHA-256   : $(awk '{print $1}' "$ARCHIVE_HASH_FILE")"
+echo "Owned by          : ${OWNER_NAME}:${OWNER_GROUP}"

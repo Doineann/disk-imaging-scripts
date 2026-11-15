@@ -8,6 +8,11 @@ for cmd in 7z sha256sum find du date dd awk; do
     fi
 done
 
+# Block size for dd. Larger blocks cut syscall overhead on fast media (modern SSDs
+# can sustain ~10 GB/s), but each dd allocates one buffer of this size, so keep it
+# modest to bound memory use across the pipeline. 64 MiB is a good balance.
+DD_BS=64M
+
 echo "========================================"
 echo "        BACKUP INTEGRITY VERIFIER       "
 echo "========================================"
@@ -61,7 +66,7 @@ ARCHIVE_HASH_FILE="${SRC_ARCHIVE}.sha256"
 
 # Unbuffered on-the-fly replacement of "copied" with "verified"
 dd_verify() {
-    dd "$@" bs=4M status=progress 2> >(awk 'BEGIN{RS="\r|\n"} NF{gsub(/copied/, "verified"); printf "\r\033[K%s", $0 > "/dev/stderr"; fflush("/dev/stderr")} END{printf "\n" > "/dev/stderr"}')
+    dd "$@" bs=$DD_BS status=progress 2> >(awk 'BEGIN{RS="\r|\n"} NF{gsub(/copied/, "verified"); printf "\r\033[K%s", $0 > "/dev/stderr"; fflush("/dev/stderr")} END{printf "\n" > "/dev/stderr"}')
 }
 
 # 1. Compressed File SHA-256 Check with Progress
@@ -71,7 +76,7 @@ if [[ -f "$ARCHIVE_HASH_FILE" ]]; then
     EXPECTED_ARCHIVE_HASH=$(awk '{print $1}' "$ARCHIVE_HASH_FILE")
 
     if command -v pv &>/dev/null; then
-        COMPUTED_ARCHIVE_HASH=$(pv "$SRC_ARCHIVE" | sha256sum | awk '{print $1}')
+        COMPUTED_ARCHIVE_HASH=$(pv -w 63 --format '%b %p %r' "$SRC_ARCHIVE" | sha256sum | awk '{print $1}')
     else
         COMPUTED_ARCHIVE_HASH=$(dd_verify if="$SRC_ARCHIVE" | sha256sum | awk '{print $1}')
     fi
@@ -93,14 +98,20 @@ echo ""
 echo "[2/2] Decompressing stream and verifying raw disk SHA-256..."
 UNCOMPRESSED_BYTES=$(7z l -slt "$SRC_ARCHIVE" 2>/dev/null | awk -F' = ' '/^Size = /{print $2; exit}')
 
+# Encrypted (PFS) backups need a password to decode. Bare `-p` can't be used here: 7z's
+# stdin is a pipe in these pipelines, so it cannot open /dev/tty to prompt (E_INVALIDARG).
+# We read the secret explicitly; blank is fine for unencrypted archives.
+read -rsp "Enter backup password (blank if none): " PASS
+echo
+
 if command -v pv &>/dev/null; then
     if [[ -n "$UNCOMPRESSED_BYTES" && "$UNCOMPRESSED_BYTES" -gt 0 ]]; then
-        COMPUTED_RAW_HASH=$(7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$UNCOMPRESSED_BYTES" | sha256sum | awk '{print $1}')
+        COMPUTED_RAW_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$UNCOMPRESSED_BYTES" -w 63 --format '%b %p %r' | sha256sum | awk '{print $1}')
     else
-        COMPUTED_RAW_HASH=$(7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -pterb | sha256sum | awk '{print $1}')
+        COMPUTED_RAW_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -pterb -w 63 --format '%b %p %r' | sha256sum | awk '{print $1}')
     fi
 else
-    COMPUTED_RAW_HASH=$(7z x -so -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | dd_verify | sha256sum | awk '{print $1}')
+    COMPUTED_RAW_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | dd_verify | sha256sum | awk '{print $1}')
 fi
 
 if [[ -f "$RAW_HASH_FILE" ]]; then
