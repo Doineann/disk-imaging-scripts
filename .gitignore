@@ -1,8 +1,7 @@
 *
 !lib/
 !lib/shared.sh
-!backup-disk.sh
-!restore-disk.sh
-!verify-disk.sh
-!verify-image.sh
+!backup.sh
+!restore.sh
+!verify.sh
 !zero-clear-free-space.sh

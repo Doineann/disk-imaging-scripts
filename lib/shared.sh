@@ -79,7 +79,7 @@ ensure_unmounted() {
 # a selection. Sets SRC_ARCHIVE to the chosen path. Returns 1 if no file selected.
 pick_archive() {
     local prompt_label="$1"
-    echo "Searching current folder for backup archives (*.img.7z / *.7z)..."
+    echo "Searching current folder for backup archives (*.disk.img.7z / *.part.img.7z / *.7z)..."
 
     mapfile -t FOUND_FILES < <(find . -maxdepth 2 -type f \( -name "*.img.7z" -o -name "*.7z" \) 2>/dev/null | sed 's|^\./||' | sort)
 
@@ -122,6 +122,81 @@ pick_archive() {
         err "File '$SRC_ARCHIVE' not found."
         return 1
     fi
+}
+
+# --- pick_source <prompt-label> -------------------------------------------
+# Lists drives, user picks a drive → lists partitions + [0] Whole disk.
+# Sets SRC_DEVICE to the chosen device path (/dev/sda or /dev/sda1).
+# Sets SRC_TYPE to "disk" or "part".
+pick_source() {
+    local prompt_label="$1"
+    echo ""
+    info "Available drives:"
+    lsblk -o NAME,SIZE,MODEL,TRAN,FSTYPE,LABEL,MOUNTPOINT
+    echo "----------------------------------------"
+
+    read -rp "${prompt_label%:} (e.g., /dev/nvme0n1 or /dev/sda): " SRC_DRIVE
+    if [[ ! -b "$SRC_DRIVE" ]]; then
+        err "'$SRC_DRIVE' is not a valid block device."
+        return 1
+    fi
+
+    # If the user typed a partition directly (e.g. /dev/sde1), detect it and skip the menu.
+    local input_name
+    input_name=$(basename "${SRC_DRIVE%/}")
+    local input_parent
+    input_parent=$(lsblk -ln -o PKNAME,NAME | awk -v x="$input_name" '$2==x{print $1; exit}')
+    if [[ -n "$input_parent" ]]; then
+        SRC_DEVICE="$SRC_DRIVE"
+        SRC_TYPE="part"
+        info "Detected partition ${C_BOLD}$SRC_DEVICE${C_RESET} (on /dev/$input_parent)."
+        return 0
+    fi
+
+    # Whole disk entered — list its partitions and let the user pick.
+    local disk_name
+    disk_name="$input_name"
+    mapfile -t PART_NAMES < <(lsblk -ln -o PKNAME,NAME | awk -v d="$disk_name" '$1==d && $2!=""{print $2}')
+
+    if [[ ${#PART_NAMES[@]} -gt 0 ]]; then
+        echo ""
+        info "Partitions on ${C_BOLD}$SRC_DRIVE${C_RESET}:"
+        echo "------------------------------------------------------------------------"
+        printf "  ${C_BOLD}[0]${C_RESET} Whole disk (%s)\n" "$disk_name"
+        for i in "${!PART_NAMES[@]}"; do
+            local name="${PART_NAMES[$i]}"
+            local dev="/dev/${name}"
+            local sz fst mp tag
+            sz=$(lsblk -no SIZE "$dev")
+            fst=$(lsblk -no FSTYPE "$dev")
+            mp=$(lsblk -no MOUNTPOINT "$dev")
+            tag=""; [[ -n "$mp" ]] && tag="  (mounted: $mp)"
+            printf "  ${C_BOLD}[%d]${C_RESET} %s   %-8s  %-10s%s\n" "$((i + 1))" "$name" "${sz:-?}" "${fst:-<none>}" "$tag"
+        done
+        echo "------------------------------------------------------------------------"
+
+        local SEL
+        while true; do
+            read -rp "Select source [0 = whole disk]: " SEL
+            if [[ "$SEL" == "0" ]]; then
+                SRC_DEVICE="$SRC_DRIVE"
+                SRC_TYPE="disk"
+                break
+            elif [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= ${#PART_NAMES[@]} )); then
+                SRC_DEVICE="/dev/${PART_NAMES[$((SEL - 1))]}"
+                SRC_TYPE="part"
+                break
+            else
+                warn "Invalid selection. Enter 0 for whole disk, or a partition number."
+            fi
+        done
+    else
+        # No partitions found — default to whole disk.
+        SRC_DEVICE="$SRC_DRIVE"
+        SRC_TYPE="disk"
+    fi
+
+    return 0
 }
 
 # --- dd_verify <dd-args...> -----------------------------------------------

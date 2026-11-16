@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
+
 if [[ $EUID -ne 0 ]]; then
     err "This script must be run as root (use sudo)."
     exit 1
@@ -12,8 +14,6 @@ for cmd in dd 7z lsblk blockdev sha256sum tee; do
         exit 1
     fi
 done
-
-source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
 
 # Resolve the human user who invoked us via sudo, so we can hand ownership of the
 # backup files back to them (the script itself runs as root). Prefer $SUDO_USER;
@@ -56,17 +56,10 @@ echo "========================================"
 bold "  FULL DISK BACKUP (dd + 7z + SHA256)   "
 echo "========================================"
 echo ""
-info "Available drives:"
-lsblk -o NAME,SIZE,MODEL,TRAN,FSTYPE,LABEL,MOUNTPOINT
-echo "----------------------------------------"
 
-read -rp "Enter the SOURCE drive to back up (e.g., /dev/nvme0n1 or /dev/sda): " SRC_DRIVE
-if [[ ! -b "$SRC_DRIVE" ]]; then
-    err "'$SRC_DRIVE' is not a valid block device."
-    exit 1
-fi
+pick_source "Enter the SOURCE drive to back up:" || exit 1
 
-if ! ensure_unmounted "$SRC_DRIVE"; then
+if ! ensure_unmounted "$SRC_DEVICE"; then
     # Reading a live disk may yield changing data; warn but allow the user to proceed.
     echo ""
     read -rp "One or more partitions are still mounted. Continue reading anyway? (y/n): " MOUNT_CONFIRM
@@ -89,7 +82,14 @@ if [[ ! -d "$DEST_DIR" ]]; then
     fi
 fi
 
-DEFAULT_NAME="fedora-backup-$(basename "$SRC_DRIVE")-$(date +%Y%m%d-%H%M).img.7z"
+# Determine filename suffix based on source type.
+if [[ "$SRC_TYPE" == "part" ]]; then
+    SUFFIX=".part.img.7z"
+else
+    SUFFIX=".disk.img.7z"
+fi
+
+DEFAULT_NAME="fedora-backup-$(basename "$SRC_DEVICE")-$(date +%Y%m%d-%H%M)${SUFFIX}"
 read -rp "Enter backup filename [$DEFAULT_NAME]: " FILENAME
 FILENAME="${FILENAME:-$DEFAULT_NAME}"
 DEST_FILE="${DEST_DIR%/}/$FILENAME"
@@ -101,12 +101,16 @@ if [[ -e "$DEST_FILE" ]]; then
     exit 1
 fi
 
-DRIVE_BYTES=$(blockdev --getsize64 "$SRC_DRIVE")
+DRIVE_BYTES=$(blockdev --getsize64 "$SRC_DEVICE")
 DRIVE_GB=$(awk "BEGIN {printf \"%.2f\", $DRIVE_BYTES / (1024^3)}")
 
 echo ""
 bold "================ SUMMARY ================"
-echo "Source Drive      : ${C_BOLD}$SRC_DRIVE${C_RESET} (${DRIVE_GB} GiB - $(lsblk -dn -o MODEL "$SRC_DRIVE"))"
+if [[ "$SRC_TYPE" == "part" ]]; then
+    echo "Source Partition  : ${C_BOLD}$SRC_DEVICE${C_RESET} (${DRIVE_GB} GiB)"
+else
+    echo "Source Drive      : ${C_BOLD}$SRC_DEVICE${C_RESET} (${DRIVE_GB} GiB - $(lsblk -dn -o MODEL "$SRC_DEVICE"))"
+fi
 echo "Destination File  : $DEST_FILE"
 echo "Checksums         : Raw Disk SHA-256 + Compressed Archive SHA-256"
 bold "========================================="
@@ -149,9 +153,9 @@ touch "$RAW_HASH_FILE"; track_file "$RAW_HASH_FILE"
 chown_backup "$RAW_HASH_FILE"
 
 if command -v pv &>/dev/null; then
-    dd if="$SRC_DRIVE" bs=$DD_BS status=none | pv -s "$DRIVE_BYTES" "${PV_OPTS[@]}" | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
+    dd if="$SRC_DEVICE" bs=$DD_BS status=none | pv -s "$DRIVE_BYTES" "${PV_OPTS[@]}" | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
 else
-    dd if="$SRC_DRIVE" bs=$DD_BS status=progress | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
+    dd if="$SRC_DEVICE" bs=$DD_BS status=progress | tee >(sha256sum | awk '{print $1 "  raw-disk-image"}' > "$RAW_HASH_FILE") | 7z a -si -mx=1 "${PW_ARG[@]}" -bso0 -bsp0 -bse1 "$DEST_FILE"
 fi
 
 # The archive now exists (possibly partial if interrupted) — track + chown it immediately.

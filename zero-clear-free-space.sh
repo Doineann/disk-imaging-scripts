@@ -43,7 +43,7 @@ wipe_free_on_mounted() {
     avail=$(df --output=avail -B1 "$mp" | tail -n 1)
     target=$(( avail - RESERVE_BYTES ))
     if (( target <= 0 )); then
-        echo "  (no free space to wipe on this partition)"
+        info "  (no free space to clear on this partition)"
         return 0
     fi
 
@@ -67,9 +67,9 @@ wipe_free_on_mounted() {
         if [[ "$fstype" == "btrfs" ]]; then chattr +C "$f"; fi   # store zeros physically, not compressed
 
         if (( nfiles == 1 )); then
-            echo "  Zeroing ~$((want / (1024*1024*1024))) GiB of free space..."
+            info "  Zeroing ~$((want / (1024*1024*1024))) GiB of free space..."
         else
-            echo "  Zeroing chunk $((idx + 1))/$nfiles (~$((want / (1024*1024*1024))) GiB)..."
+            info "  Zeroing chunk $((idx + 1))/$nfiles (~$((want / (1024*1024*1024))) GiB)..."
         fi
 
         ok=0
@@ -93,75 +93,77 @@ wipe_free_on_mounted() {
 main() {
     echo ""
     echo "========================================"
-    bold "   WIPE FREE SPACE ON PARTITIONS        "
+    bold "   CLEAR FREE SPACE ON PARTITIONS       "
     echo "========================================"
     echo ""
+
+    # --- Source selection: whole disk or single partition ---------------------
+    local SRC_DEVICE SRC_TYPE
+    pick_source "Enter the DISK or PARTITION to clear:" || exit 1
+
+    # Build the partition list based on what was selected.
+    local PART_NAMES=() PART_SIZE=() PART_FSTYPE=() PART_MP=()
+    if [[ "$SRC_TYPE" == "part" ]]; then
+        # Single partition selected — use it directly.
+        PART_NAMES=( "$(basename "${SRC_DEVICE%/}")" )
+        PART_SIZE[0]=$(lsblk -no SIZE "$SRC_DEVICE")
+        PART_FSTYPE[0]=$(lsblk -no FSTYPE "$SRC_DEVICE")
+        PART_MP[0]=$(lsblk -no MOUNTPOINT "$SRC_DEVICE")
+    else
+        # Whole disk selected — enumerate all partitions.
+        local disk_name
+        disk_name=$(basename "${SRC_DEVICE%/}")
+        mapfile -t PART_NAMES < <(lsblk -ln -o PKNAME,NAME | awk -v d="$disk_name" '$1==d && $2!=""{print $2}')
+        if [[ ${#PART_NAMES[@]} -eq 0 ]]; then
+            warn "No partitions found on /dev/$disk_name."
+            exit 1
+        fi
+        for i in "${!PART_NAMES[@]}"; do
+            local dev="/dev/${PART_NAMES[$i]}"
+            PART_SIZE[i]=$(lsblk -no SIZE "$dev")
+            PART_FSTYPE[i]=$(lsblk -no FSTYPE "$dev")
+            PART_MP[i]=$(lsblk -no MOUNTPOINT "$dev")
+        done
+    fi
+
+    # Display partitions.
     echo ""
-    echo "Available drives and partitions:"
-    lsblk -o NAME,SIZE,MODEL,TRAN,FSTYPE,LABEL,MOUNTPOINT
-    echo "----------------------------------------"
-
-    read -rp "Enter the DISK whose partitions to wipe (e.g. /dev/nvme0n1 or /dev/sda): " DISK_DEV
-    local disk_name
-    disk_name=$(basename "${DISK_DEV%/}")
-
-    if [[ ! -b "/dev/$disk_name" ]]; then
-        echo "Error: '/dev/$disk_name' is not a block device."
-        exit 1
-    fi
-    # Refuse partitions: only operate on whole disks.
-    local parent
-    parent=$(lsblk -ln -o PKNAME,NAME | awk -v x="$disk_name" '$2==x{print $1; exit}')
-    if [[ -n "$parent" ]]; then
-        echo "Error: '/dev/$disk_name' is a partition of /dev/$parent. Enter the whole disk."
-        exit 1
-    fi
-
-    # Enumerate this disk's partitions (clean, undecorated names).
-    mapfile -t PART_NAMES < <(lsblk -ln -o PKNAME,NAME | awk -v d="$disk_name" '$1==d && $2!=""{print $2}')
-    if [[ ${#PART_NAMES[@]} -eq 0 ]]; then
-        echo "No partitions found on /dev/$disk_name."
-        exit 1
-    fi
-
-    # Gather per-partition info.
-    local PART_SIZE=() PART_FSTYPE=() PART_MP=()
-    echo ""
-    echo "Partitions on /dev/$disk_name:"
+    info "Partitions on ${C_BOLD}$SRC_DEVICE${C_RESET}:"
     echo "------------------------------------------------------------------------"
     for i in "${!PART_NAMES[@]}"; do
         local name="${PART_NAMES[$i]}"
-        local dev="/dev/${name}"
-        local sz fst mp tag
-        sz=$(lsblk -no SIZE "$dev")
-        fst=$(lsblk -no FSTYPE "$dev")
-        mp=$(lsblk -no MOUNTPOINT "$dev")
-        PART_SIZE[i]="$sz"; PART_FSTYPE[i]="$fst"; PART_MP[i]="$mp"
-        tag=""; [[ -n "$mp" ]] && tag="  (mounted: $mp)"
-        printf "  [%d] %s   %-8s  %-10s%s\n" "$((i + 1))" "$name" "${sz:-?}" "${fst:-<none>}" "$tag"
+        local tag=""
+        [[ -n "${PART_MP[$i]}" ]] && tag="  (mounted: ${PART_MP[$i]})"
+        printf "  ${C_BOLD}[%d]${C_RESET} %s   %-8s  %-10s%s\n" "$((i + 1))" "$name" "${PART_SIZE[$i]:-?}" "${PART_FSTYPE[$i]:-<none>}" "$tag"
     done
     echo "------------------------------------------------------------------------"
 
     # Selection.
     local SEL SELECTED=() s SEL_RE='^[0-9][0-9 ,]*$'
-    while true; do
-        read -rp "Wipe free space on which partition(s)?  [numbers, or 'a' = all unmounted]: " SEL
-        if [[ "$SEL" == "a" || "$SEL" == "A" ]]; then
-            for i in "${!PART_NAMES[@]}"; do [[ -z "${PART_MP[$i]}" ]] && SELECTED+=("$i"); done
-            break
-        elif [[ "$SEL" =~ $SEL_RE ]]; then
-            SELECTED=()
-            for s in ${SEL//,/ }; do
-                if (( s >= 1 && s <= ${#PART_NAMES[@]} )); then SELECTED+=("$((s - 1))"); fi
-            done
-            break
-        else
-            echo "Invalid selection. Enter numbers (e.g. '1 3'), or 'a' for all unmounted."
-        fi
-    done
+    if [[ ${#PART_NAMES[@]} -eq 1 ]]; then
+        # Single partition — no need to ask, just confirm.
+        info "Clearing free space on ${C_BOLD}${PART_NAMES[0]}${C_RESET}."
+        SELECTED=(0)
+    else
+        while true; do
+            read -rp "Clear free space on which partition(s)?  [numbers, or 'a' = all]: " SEL
+            if [[ "$SEL" == "a" || "$SEL" == "A" ]]; then
+                for i in "${!PART_NAMES[@]}"; do SELECTED+=("$i"); done
+                break
+            elif [[ "$SEL" =~ $SEL_RE ]]; then
+                SELECTED=()
+                for s in ${SEL//,/ }; do
+                    if (( s >= 1 && s <= ${#PART_NAMES[@]} )); then SELECTED+=("$((s - 1))"); fi
+                done
+                break
+            else
+                warn "Invalid selection. Enter numbers (e.g. '1 3'), or 'a' for all."
+            fi
+        done
+    fi
 
     if [[ ${#SELECTED[@]} -eq 0 ]]; then
-        echo "No partitions selected. Nothing to do."
+        info "No partitions selected. Nothing to do."
         exit 0
     fi
 
@@ -170,7 +172,7 @@ main() {
     # not the partition — so mount each one read-only first to measure real free space.
     local total_bytes=0 a probe_mp
     for i in "${SELECTED[@]}"; do
-        if [[ -n "${PART_MP[$i]}" ]]; then continue; fi   # mounted -> skipped at run time
+        if [[ -n "${PART_MP[$i]}" ]]; then continue; fi   # mounted -> will unmount at run time
         probe_mp="$BASE_WORK/probe_${PART_NAMES[$i]}"
         mkdir -p -- "$probe_mp"
         if mount -o ro "/dev/${PART_NAMES[$i]}" "$probe_mp"; then
@@ -178,7 +180,7 @@ main() {
             umount "$probe_mp"
             total_bytes=$(( total_bytes + a ))
         else
-            echo "  (could not probe ${PART_NAMES[$i]} read-only; excluded from estimate)"
+            warn "  (could not probe ${PART_NAMES[$i]} read-only; excluded from estimate)"
         fi
         rmdir -- "$probe_mp" 2>/dev/null || true
     done
@@ -186,11 +188,11 @@ main() {
     total_gib=$(awk "BEGIN{printf \"%.2f\", $total_bytes/1073741824}")
 
     echo ""
-    echo "This will WRITE ~${total_gib} GiB of zeros (a full physical write of the free space)."
-    echo "It is a normal disk-wear operation and may take a while. Do NOT interrupt or power off."
-    read -rp "Type 'WIPE' to continue: " CONFIRM
-    if [[ "$CONFIRM" != "WIPE" ]]; then
-        echo "Aborted."
+    warn "This will WRITE ~${C_BOLD}${total_gib} GiB${C_RESET} of zeros (a full physical write of the free space)."
+    warn "It is a normal disk-wear operation and may take a while. Do NOT interrupt or power off."
+    read -rp "Type 'CLEAR' to continue: " CONFIRM
+    if [[ "$CONFIRM" != "CLEAR" ]]; then
+        info "Aborted."
         exit 0
     fi
 
@@ -199,14 +201,16 @@ main() {
         local name="${PART_NAMES[$i]}"
         local dev="/dev/${name}"
         local fstype gib
-        if [[ -n "${PART_MP[$i]}" ]]; then
-            echo "SKIP ${name}: currently mounted (${PART_MP[$i]}). Unmount it first."
-            continue
-        fi
         fstype="${PART_FSTYPE[$i]}"
         if [[ -z "$fstype" ]]; then
-            echo "SKIP ${name}: no filesystem (raw/unformatted)."
+            warn "SKIP ${C_BOLD}${name}${C_RESET}: no filesystem (raw/unformatted)."
             continue
+        fi
+
+        # Unmount if currently mounted, so we can remount cleanly for the zero-write.
+        if [[ -n "${PART_MP[$i]}" ]]; then
+            info "Unmounting ${C_BOLD}${name}${C_RESET} (${PART_MP[$i]})..."
+            umount "/dev/${name}" 2>/dev/null || true
         fi
 
         CURRENT_MP="$BASE_WORK/${name}"
@@ -215,7 +219,7 @@ main() {
         CURRENT_TMP="$CURRENT_MP/.wipe_free_tmp"
 
         echo ""
-        echo "Wiping free space on ${name} (${fstype})..."
+        info "Clearing free space on ${C_BOLD}${name}${C_RESET} (${fstype})..."
         wipe_free_on_mounted "$CURRENT_MP" "$fstype"
 
         sync
@@ -224,24 +228,24 @@ main() {
         CURRENT_MP=""; CURRENT_TMP=""
 
         gib=$(awk "BEGIN{printf \"%.2f\", $CLEARED_BYTES/1073741824}")
-        echo "OK: cleared ~${gib} GiB of free space on ${name}."
+        ok "Cleared ~${gib} GiB of free space on ${C_BOLD}${name}${C_RESET}."
     done
 
     echo ""
     echo "========================================"
-    bold "  DONE: FREE SPACE ZEROED              "
+    bold "  DONE: FREE SPACE CLEARED             "
     echo "========================================"
 }
 
 # Enforce runtime guards and run only when executed directly (not sourced by tests).
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     if [[ $EUID -ne 0 ]]; then
-        echo "Error: This script must be run as root (use sudo)."
+        err "This script must be run as root (use sudo)."
         exit 1
     fi
     for cmd in dd df lsblk mount umount chattr awk; do
         if ! command -v "$cmd" &>/dev/null; then
-            echo "Error: Required command '$cmd' is not installed."
+            err "Required command '$cmd' is not installed."
             exit 1
         fi
     done
