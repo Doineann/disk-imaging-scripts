@@ -43,7 +43,6 @@ bold() { printf "${C_BOLD}%s${C_RESET}\n" "$*"; }
 # Returns 0 if no mounts remain after the prompt, 1 if some are still mounted.
 ensure_unmounted() {
     local dev="$1"
-    # Collect the mountpoints of this disk's partitions that are currently mounted.
     local mps=() mp
     while IFS= read -r mp; do
         [[ -n "$mp" ]] && mps+=("$mp")
@@ -61,9 +60,8 @@ ensure_unmounted() {
         return 1
     fi
 
-    local ok=0 m2
+    local ok=0
     for m in "${mps[@]}"; do
-        # The mountpoint may be a bind/loop path; unmount the device itself.
         if umount "$m" 2>/dev/null; then
             ok "Unmounted $m."
         else
@@ -75,13 +73,17 @@ ensure_unmounted() {
 }
 
 # --- pick_archive <prompt-label> ------------------------------------------
-# Prints a numbered list of .7z backup files found in CWD (maxdepth 2) and reads
-# a selection. Sets SRC_ARCHIVE to the chosen path. Returns 1 if no file selected.
+# Prints a numbered list of .zstd / .zstd.enc backup files found in CWD (maxdepth 2)
+# and reads a selection. Sets SRC_ARCHIVE to the chosen path. Returns 1 if not found.
 pick_archive() {
     local prompt_label="$1"
-    echo "Searching current folder for backup archives (*.disk.img.7z / *.part.img.7z / *.7z)..."
+    echo "Searching current folder for backup archives (*.zstd / *.zstd.enc)..."
 
-    mapfile -t FOUND_FILES < <(find . -maxdepth 2 -type f \( -name "*.img.7z" -o -name "*.7z" \) 2>/dev/null | sed 's|^\./||' | sort)
+    mapfile -t FOUND_FILES < <(
+        find . -maxdepth 2 -type f \( -name "*.zstd" -o -name "*.zstd.enc" \) 2>/dev/null |
+            sed 's|^\./||' |
+            sort
+    )
 
     SRC_ARCHIVE=""
 
@@ -93,18 +95,19 @@ pick_archive() {
             FILE_PATH="${FOUND_FILES[$i]}"
             FILE_SIZE=$(du -h "$FILE_PATH" 2>/dev/null | cut -f1)
             FILE_DATE=$(date -r "$FILE_PATH" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown date")
-            printf "  ${C_BOLD}[%d]${C_RESET} %s (%s, %s)\n" "$((i + 1))" "$FILE_PATH" "$FILE_SIZE" "$FILE_DATE"
+            ENC_TAG=""
+            [[ "$FILE_PATH" == *.enc ]] && ENC_TAG=" ${C_YELLOW}[Encrypted]${C_RESET}"
+            printf "  ${C_BOLD}[%d]${C_RESET} %s (%s, %s)%s\n" "$((i + 1))" "$FILE_PATH" "$FILE_SIZE" "$FILE_DATE" "$ENC_TAG"
         done
-        echo "  [0] Enter a custom file path manually"
+        echo "  Enter a custom file path manually"
         echo "------------------------------------------------------------------------"
 
-        # Strip any trailing colon from the label so we don't get "::" in the prompt.
         local clean_label="${prompt_label%:}"
         while true; do
             read -rp "${clean_label}: " CHOICE
             if [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
                 if [[ "$CHOICE" -eq 0 ]]; then
-                    read -rp "Enter the full path to the backup .7z file: " SRC_ARCHIVE
+                    read -rp "Enter the full path to the backup file (.zstd / .zstd.enc): " SRC_ARCHIVE
                     break
                 elif [[ "$CHOICE" -ge 1 && "$CHOICE" -le ${#FOUND_FILES[@]} ]]; then
                     SRC_ARCHIVE="${FOUND_FILES[$((CHOICE - 1))]}"
@@ -114,8 +117,8 @@ pick_archive() {
             warn "Invalid selection. Please enter a number from the list above."
         done
     else
-        warn "No .7z backup files found in the current folder."
-        read -rp "Enter the full path to the backup .7z file: " SRC_ARCHIVE
+        warn "No .zstd or .zstd.enc backup files found in the current folder."
+        read -rp "Enter the full path to the backup file (.zstd / .zstd.enc): " SRC_ARCHIVE
     fi
 
     if [[ ! -f "$SRC_ARCHIVE" ]]; then
@@ -125,7 +128,7 @@ pick_archive() {
 }
 
 # --- pick_source <prompt-label> -------------------------------------------
-# Lists drives, user picks a drive → lists partitions + [0] Whole disk.
+# Lists drives, user picks a drive -> lists partitions + Whole disk.
 # Sets SRC_DEVICE to the chosen device path (/dev/sda or /dev/sda1).
 # Sets SRC_TYPE to "disk" or "part".
 pick_source() {
@@ -141,7 +144,6 @@ pick_source() {
         return 1
     fi
 
-    # If the user typed a partition directly (e.g. /dev/sde1), detect it and skip the menu.
     local input_name
     input_name=$(basename "${SRC_DRIVE%/}")
     local input_parent
@@ -153,7 +155,6 @@ pick_source() {
         return 0
     fi
 
-    # Whole disk entered — list its partitions and let the user pick.
     local disk_name
     disk_name="$input_name"
     mapfile -t PART_NAMES < <(lsblk -ln -o PKNAME,NAME | awk -v d="$disk_name" '$1==d && $2!=""{print $2}')
@@ -162,7 +163,7 @@ pick_source() {
         echo ""
         info "Partitions on ${C_BOLD}$SRC_DRIVE${C_RESET}:"
         echo "------------------------------------------------------------------------"
-        printf "  ${C_BOLD}[0]${C_RESET} Whole disk (%s)\n" "$disk_name"
+        printf "  ${C_BOLD}${C_RESET} Whole disk (%s)\n" "$disk_name"
         for i in "${!PART_NAMES[@]}"; do
             local name="${PART_NAMES[$i]}"
             local dev="/dev/${name}"
@@ -191,7 +192,6 @@ pick_source() {
             fi
         done
     else
-        # No partitions found — default to whole disk.
         SRC_DEVICE="$SRC_DRIVE"
         SRC_TYPE="disk"
     fi
@@ -200,8 +200,8 @@ pick_source() {
 }
 
 # --- dd_verify <dd-args...> -----------------------------------------------
-# Fallback progress display when pv is unavailable. Runs dd with status=progress,
-# rewriting "copied" to "verified" in the live stderr line.
+# Fallback progress display when pv is unavailable. Passes stream to stdout while
+# rewriting "copied" to "verified" on stderr.
 dd_verify() {
-    dd "$@" bs=$DD_BS status=progress 2> >(awk 'BEGIN{RS="\r|\n"} NF{gsub(/copied/, "verified"); printf "\r\033[K%s", $0 > "/dev/stderr"; fflush("/dev/stderr")} END{printf "\n" > "/dev/stderr"}')
+    dd "$@" bs=$DD_BS status=progress 2> >(sed -u 's/copied/verified/g' >&2)
 }

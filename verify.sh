@@ -1,20 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source "$(dirname "${BASH_SOURCE[0]}")/lib/shared.sh"
+source "$(dirname "${BASH_SOURCE}")/lib/shared.sh"
 
-for cmd in 7z sha256sum find du date dd awk; do
+for cmd in zstd openssl sha256sum lsblk blockdev dd awk wc; do
     if ! command -v "$cmd" &>/dev/null; then
         err "Required command '$cmd' is not installed."
         exit 1
     fi
 done
 
+TMP_BYTE_COUNT=""
+cleanup_on_exit() {
+    unset BACKUP_PASS
+    [[ -n "${TMP_BYTE_COUNT:-}" ]] && rm -f -- "$TMP_BYTE_COUNT"
+}
+trap cleanup_on_exit EXIT
+
 echo ""
-echo "========================================"
-bold "           DISK VERIFICATION            "
-echo "========================================"
+echo "=============================================="
+bold "   DISK VERIFICATION (OpenSSL + zstd + SHA)   "
+echo "=============================================="
 echo ""
+
+# ============================================================================
+# PHASE 1: Gather all inputs & authentication upfront
+# ============================================================================
 
 pick_archive "Select a backup to verify:"
 
@@ -23,32 +34,71 @@ if [[ ! -f "$SRC_ARCHIVE" ]]; then
     exit 1
 fi
 
+# Detect encryption and image type from filename suffix.
+IS_ENCRYPTED=0
+[[ "$SRC_ARCHIVE" == *.enc ]] && IS_ENCRYPTED=1
+
+case "$SRC_ARCHIVE" in
+    *.part.img.zstd|*.part.img.zstd.enc) SRC_TYPE="part" ;;
+    *.disk.img.zstd|*.disk.img.zstd.enc) SRC_TYPE="disk" ;;
+    *)                                   SRC_TYPE="disk" ;;
+esac
+
 echo ""
 info "Selected: ${C_BOLD}$SRC_ARCHIVE${C_RESET}"
-
-# Detect type from filename suffix.
-case "$SRC_ARCHIVE" in
-    *.part.img.7z)  SRC_TYPE="part" ;;
-    *.disk.img.7z)  SRC_TYPE="disk" ;;
-    *)              SRC_TYPE="disk" ;;  # fallback for legacy .img.7z / .7z names
-esac
+if (( IS_ENCRYPTED == 1 )); then
+    info "Format  : zstd compressed + OpenSSL AES-256-CBC encrypted"
+else
+    info "Format  : zstd compressed (unencrypted)"
+fi
 
 RAW_HASH_FILE="${SRC_ARCHIVE}.raw.sha256"
 ARCHIVE_HASH_FILE="${SRC_ARCHIVE}.sha256"
 
-# Uncompressed size from archive metadata (header-only; no decompression).
-UNCOMPRESSED_BYTES=$(7z l -slt "$SRC_ARCHIVE" 2>/dev/null | awk -F' = ' '/^Size = /{print $2; exit}')
+# Uncompressed size from zstd frame header (available when unencrypted and --stream-size was used).
+UNCOMPRESSED_BYTES=""
+if (( IS_ENCRYPTED == 0 )); then
+    UNCOMPRESSED_BYTES=$(zstd -lv "$SRC_ARCHIVE" 2>/dev/null | awk '/Frame Content Size:/ {print $4; exit}' || true)
+    [[ "$UNCOMPRESSED_BYTES" == "0" ]] && UNCOMPRESSED_BYTES=""
+fi
 
-# --- Step 1: Ask if also verify against a disk/partition -------------------
+# Prompt for password upfront if encrypted, and do a fast 64 KiB test decode so
+# a typo is caught immediately rather than after hashing a huge archive.
+PASS=""
+if (( IS_ENCRYPTED == 1 )); then
+    echo ""
+    read -rsp "Enter backup password: " PASS
+    echo
+    if [[ -z "$PASS" ]]; then
+        err "Archive is encrypted (.enc), password cannot be blank."
+        exit 1
+    fi
+
+    export BACKUP_PASS="$PASS"
+    TEST_BYTES=$(
+        { openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass env:BACKUP_PASS -in "$SRC_ARCHIVE" 2>/dev/null |
+          zstd -d -T0 -q |
+          head -c 65536 | wc -c; } || true
+    )
+    if [[ "${TEST_BYTES:-0}" -eq 0 ]]; then
+        err "Quick password check failed (wrong password or corrupt stream)."
+        exit 1
+    fi
+fi
+
+# Ask upfront if also verifying against a physical disk/partition.
 echo ""
 read -rp "Also verify this image against a disk or partition? (y/n): " DEVICE_CHECK
 DEVICE_CHECK="${DEVICE_CHECK:-n}"
 DEST_DEVICE=""
+SUDO=""
+TARGET_BYTES=0
+
 if [[ "$DEVICE_CHECK" =~ ^[Yy]$ ]]; then
-    # Only dd needs root to open a block device. lsblk/blockdev work as any user.
-    SUDO=""
     if [[ $EUID -ne 0 ]]; then
         SUDO="sudo"
+        info "Admin rights are required to read block devices."
+        sudo -v
     fi
 
     echo ""
@@ -67,7 +117,7 @@ if [[ "$DEVICE_CHECK" =~ ^[Yy]$ ]]; then
         exit 1
     fi
 
-    # Type-mismatch guard: partition image → partition target, disk image → whole-disk target.
+    # Type-mismatch guard: partition image -> partition target, disk image -> whole-disk target.
     parent=$(lsblk -ln -o PKNAME,NAME | awk -v x="$(basename "${DEST_DEVICE%/}")" '$2==x{print $1; exit}')
     if [[ "$SRC_TYPE" == "part" && -z "$parent" ]]; then
         err "'$DEST_DEVICE' is a whole disk. A partition image must be verified against a PARTITION (e.g., /dev/sda1)."
@@ -78,14 +128,12 @@ if [[ "$DEVICE_CHECK" =~ ^[Yy]$ ]]; then
         exit 1
     fi
 
-    # Size check: image must fit in the target. (blockdev needs root to open the device)
     TARGET_BYTES=$($SUDO blockdev --getsize64 "$DEST_DEVICE")
     if [[ -n "$UNCOMPRESSED_BYTES" && "$UNCOMPRESSED_BYTES" -gt "$TARGET_BYTES" ]]; then
         err "Image ($UNCOMPRESSED_BYTES B) is larger than target device ($TARGET_BYTES B)."
         exit 1
     fi
 
-    # Reading a live disk may yield changing data — offer to unmount.
     if ! ensure_unmounted "$DEST_DEVICE"; then
         echo ""
         read -rp "One or more partitions are still mounted. Continue reading anyway? (y/n): " MOUNT_CONFIRM
@@ -96,10 +144,25 @@ if [[ "$DEVICE_CHECK" =~ ^[Yy]$ ]]; then
     fi
 fi
 
-# --- Step 2: Verify compressed archive SHA-256 ----------------------------
+# ============================================================================
+# PHASE 2: Run all verification steps unattended
+# ============================================================================
+
+decode_stream() {
+    local archive="$1"
+    if (( IS_ENCRYPTED == 1 )); then
+        export BACKUP_PASS="$PASS"
+        openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass env:BACKUP_PASS -in "$archive" |
+            zstd -d -T0 -q
+    else
+        zstd -d -T0 -q -c "$archive"
+    fi
+}
+
+# --- Step 1: Verify compressed/encrypted archive SHA-256 -------------------
 echo ""
 if [[ -f "$ARCHIVE_HASH_FILE" ]]; then
-    info "[1/3] Verifying compressed archive SHA-256..."
+    info "[1/3] Verifying archive SHA-256..."
     EXPECTED_ARCHIVE_HASH=$(awk '{print $1}' "$ARCHIVE_HASH_FILE")
 
     if command -v pv &>/dev/null; then
@@ -109,34 +172,48 @@ if [[ -f "$ARCHIVE_HASH_FILE" ]]; then
     fi
 
     if [[ "$COMPUTED_ARCHIVE_HASH" == "$EXPECTED_ARCHIVE_HASH" ]]; then
-        ok "Compressed file matches original checksum ($COMPUTED_ARCHIVE_HASH)."
+        ok "Archive file matches original checksum ($COMPUTED_ARCHIVE_HASH)."
     else
-        err "Compressed archive SHA-256 mismatch!"
+        err "Archive SHA-256 mismatch!"
         echo "Expected: $EXPECTED_ARCHIVE_HASH"
         echo "Actual  : $COMPUTED_ARCHIVE_HASH"
         exit 1
     fi
 else
-    warn "[1/3] No .sha256 file found for compressed archive (skipping)."
+    warn "[1/3] No .sha256 file found for archive (skipping)."
 fi
 
-# --- Step 3: Decode stream, verify raw image SHA-256 -----------------------
+# --- Step 2: Decode stream, verify raw image SHA-256 -----------------------
 echo ""
 info "[2/3] Decompressing stream and verifying raw image SHA-256..."
 
-# Encrypted backups need a password to decode. Bare `-p` can't be used here: 7z's
-# stdin is a pipe in these pipelines, so it cannot open /dev/tty to prompt (E_INVALIDARG).
-read -rsp "Enter backup password (blank if none): " PASS
-echo
+TMP_BYTE_COUNT=$(mktemp "${TMPDIR:-/tmp}/verify-bytes.XXXXXX")
 
 if command -v pv &>/dev/null; then
     if [[ -n "$UNCOMPRESSED_BYTES" && "$UNCOMPRESSED_BYTES" -gt 0 ]]; then
-        COMPUTED_RAW_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -s "$UNCOMPRESSED_BYTES" "${PV_OPTS[@]}" | sha256sum | awk '{print $1}')
+        COMPUTED_RAW_HASH=$(decode_stream "$SRC_ARCHIVE" |
+            pv -s "$UNCOMPRESSED_BYTES" "${PV_OPTS[@]}" |
+            tee >(wc -c > "$TMP_BYTE_COUNT") |
+            sha256sum | awk '{print $1}')
     else
-        COMPUTED_RAW_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | pv -pterb "${PV_OPTS[@]}" | sha256sum | awk '{print $1}')
+        COMPUTED_RAW_HASH=$(decode_stream "$SRC_ARCHIVE" |
+            pv -pterb "${PV_OPTS[@]}" |
+            tee >(wc -c > "$TMP_BYTE_COUNT") |
+            sha256sum | awk '{print $1}')
     fi
 else
-    COMPUTED_RAW_HASH=$(7z x -so -p"$PASS" -bso0 -bsp0 -bse1 "$SRC_ARCHIVE" | dd_verify | sha256sum | awk '{print $1}')
+    COMPUTED_RAW_HASH=$(decode_stream "$SRC_ARCHIVE" |
+        dd_verify |
+        tee >(wc -c > "$TMP_BYTE_COUNT") |
+        sha256sum | awk '{print $1}')
+fi
+
+wait
+ACTUAL_UNCOMPRESSED_BYTES=$(tr -d ' \n' < "$TMP_BYTE_COUNT")
+
+if [[ -z "$ACTUAL_UNCOMPRESSED_BYTES" || "$ACTUAL_UNCOMPRESSED_BYTES" -eq 0 ]]; then
+    err "Decompression produced 0 bytes (wrong password or corrupt stream)."
+    exit 1
 fi
 
 if [[ -f "$RAW_HASH_FILE" ]]; then
@@ -150,18 +227,30 @@ if [[ -f "$RAW_HASH_FILE" ]]; then
         exit 1
     fi
 else
-    ok "Decompression succeeded with no 7z CRC errors."
+    ok "Decompression succeeded with valid zstd checksums (no .raw.sha256 sidecar found)."
 fi
 
-# --- Step 4: (optional) Verify against disk/partition -----------------------
+# --- Step 3: (optional) Verify against disk/partition -----------------------
 if [[ "$DEVICE_CHECK" =~ ^[Yy]$ ]]; then
     echo ""
-    info "[3/3] Reading $DEST_DEVICE and computing its SHA-256..."
+    info "[3/3] Reading $DEST_DEVICE ($ACTUAL_UNCOMPRESSED_BYTES bytes) and computing its SHA-256..."
+
+    if [[ "$ACTUAL_UNCOMPRESSED_BYTES" -gt "$TARGET_BYTES" ]]; then
+        err "Image ($ACTUAL_UNCOMPRESSED_BYTES B) is larger than target device ($TARGET_BYTES B)."
+        exit 1
+    fi
+
+    # Refresh sudo timestamp in case steps [1/3] and [2/3] took longer than the sudo timeout.
+    [[ -n "$SUDO" ]] && sudo -n true 2>/dev/null || true
 
     if command -v pv &>/dev/null; then
-        COMPUTED_DISK_HASH=$($SUDO dd if="$DEST_DEVICE" bs=$DD_BS count="$UNCOMPRESSED_BYTES" iflag=count_bytes status=none | pv -s "$UNCOMPRESSED_BYTES" "${PV_OPTS[@]}" | sha256sum | awk '{print $1}')
+        COMPUTED_DISK_HASH=$($SUDO dd if="$DEST_DEVICE" bs=$DD_BS count="$ACTUAL_UNCOMPRESSED_BYTES" iflag=count_bytes status=none |
+            pv -s "$ACTUAL_UNCOMPRESSED_BYTES" "${PV_OPTS[@]}" |
+            sha256sum | awk '{print $1}')
     else
-        COMPUTED_DISK_HASH=$($SUDO dd if="$DEST_DEVICE" bs=$DD_BS count="$UNCOMPRESSED_BYTES" iflag=count_bytes status=none 2>/dev/null | dd_verify | sha256sum | awk '{print $1}')
+        COMPUTED_DISK_HASH=$($SUDO dd if="$DEST_DEVICE" bs=$DD_BS count="$ACTUAL_UNCOMPRESSED_BYTES" iflag=count_bytes status=none 2>/dev/null |
+            dd_verify |
+            sha256sum | awk '{print $1}')
     fi
 
     if [[ "$COMPUTED_RAW_HASH" == "$COMPUTED_DISK_HASH" ]]; then
@@ -176,6 +265,6 @@ fi
 
 # --- Summary ----------------------------------------------------------------
 echo ""
-echo "========================================"
-bold "  ALL CHECKS PASSED: BACKUP IS HEALTHY  "
-echo "========================================"
+echo "=============================================="
+bold "    ALL CHECKS PASSED: BACKUP IS HEALTHY      "
+echo "=============================================="
